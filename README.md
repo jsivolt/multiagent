@@ -146,3 +146,124 @@ Live tests skip if the daemon is unreachable and remove everything they create.
 * Persist the registry (SQLite/Redis) for re-attachment and audit, add a work queue with priorities/backpressure,
   structured logging/metrics, and an async Docker API client if scale demands it.
 * Workspace for code tasks: per-task volume/clone with size quota, collected via `docker cp`/archive into an artifact store.
+
+---
+
+# Phase 2 — real coding agent runtime
+
+Phase 2 runs the real **Pi** coding agent (`@earendil-works/pi-coding-agent` 1.5.2, <https://pi.dev>) inside the same kind of hardened
+container, behind a runtime adapter. Phase 1 (mock agent, `run`/`demo`/`status`/`cleanup`) is unchanged and still passes its tests.
+The full test evidence is in [REPORT_PHASE2.md](REPORT_PHASE2.md).
+
+## Architecture
+
+```text
+ python -m orchestrator task ...  /  TaskManager API
+              |
+          TaskManager (orchestrator/tasks.py)  -- reuses Phase 1 Orchestrator (run id, lease, docker client),
+              |                                   StateMachine, RunLease, build_create_args hardening
+   +----------+-----------+
+   |                      |
+ AgentRuntime adapter   Docker container (network none, read-only rootfs, non-root, caps dropped, limits)
+ (runtimes/pi.py)         /workspace      <- workspaces/<workspace_id>/   (bind mount, rw, ONLY this task's dir)
+   prepare()              /run/task       <- .tasks/<id>/runtime/         (ro: models.json, prompt.txt)
+   parse output           /run/secrets    <- .tasks/<id>/secrets/         (ro, only if credentials requested, deleted after)
+   classify               /run/llm        <- tmp dir with unix socket     (ro) -> host-side filtered model relay -> Ollama
+```
+
+Lifecycle: `CREATED → PREPARING → STARTING → RUNNING → COMPLETED | FAILED | TIMED_OUT | CANCELLED → (collect results, persist) → CLEANUP → REMOVED`.
+The result is written to `.tasks/<id>/result.json` *before* the container is removed, so it outlives the container.
+
+| File | Role |
+|---|---|
+| `orchestrator/tasks.py` | `TaskManager`: `submit_task`, `get_task`, `get_task_events`, `cancel_task`, `get_task_result` (+ `stream_events`, `wait`, `list_tasks`, `reconcile`, `cleanup_workspace`, `purge_task`) |
+| `orchestrator/runtimes/base.py` | adapter interface (`AgentRuntime.prepare`, `OutputParser.feed/classify/summary`) and registry |
+| `orchestrator/runtimes/pi.py` | Pi adapter: CLI invocation (`pi --mode json`), JSONL → normalized events, failure classification |
+| `orchestrator/llm_relay.py` | host-side, per-task model relay (route + model allow-list) reachable only through a bind-mounted unix socket |
+| `orchestrator/workspace.py` | workspace creation, baseline snapshot, change/diff collection, symlink/FIFO-safe scanning |
+| `agent/pi/` | Pi image: `Dockerfile`, `package-lock.json` (pinned install), `entrypoint.sh`, `llm-relay.js` |
+
+Adding another runtime = one module implementing `AgentRuntime` + `OutputParser` and `register(...)`; the core is unchanged.
+Mapping to the abstract interface: `prepare` → `AgentRuntime.prepare`; `start`/`getStatus`/`cancel` → `TaskManager` (identical for
+every CLI: docker create/start/stop); `streamEvents` → `OutputParser.feed`; `collectResult` → `OutputParser.summary/classify` + workspace diff.
+
+## Build and run
+
+```bash
+python3 -m orchestrator build --runtime pi        # builds multiagent-poc-pi:phase2 for YOUR uid (apt + npm run inside the build)
+ollama list                                       # default model: qwen3-vl:8b (any tool-capable local model works)
+
+python -m orchestrator task run --prompt "Create a Python script named hello.py that prints 'Hello from Coding Agent'." \
+    --workspace task-001 --model qwen3-vl:8b --timeout 600
+python -m orchestrator task get|events|result|cancel <task_id>     # work across processes (state lives on disk)
+python -m orchestrator task list
+python -m orchestrator task reconcile --wait                       # after an orchestrator crash/restart
+python -m orchestrator task cleanup-workspace <workspace_id> --yes # delete artifacts (separate from container removal)
+```
+
+Task request (flat or nested, JSON via `--config` or the Python API; `network` only accepts `none`):
+
+```json
+{"runtime": "pi", "prompt": "Create a hello.py script", "workspace": "task-001", "timeoutSeconds": 900,
+ "agent": {"model": "qwen3-vl:8b", "provider": "ollama"},
+ "container": {"memory": "2g", "cpus": 2, "pids": 512, "network": "none"},
+ "credentials": [], "workspaceQuotaMb": 256}
+```
+
+`workspace` is a *logical id* (`[A-Za-z0-9_.-]{1,64}`, validated), never a path. A workspace can be used by one live task at a time.
+
+## Model access and credentials
+
+* **Default: local Ollama, no credentials.** The container has *no network*. Model traffic goes through a task-scoped unix socket served by
+  the orchestrator, which forwards only `POST /v1/chat/completions` and `GET /v1/models*`, only for the task's configured model, only to
+  `127.0.0.1:11434`. `/api/pull`, `/api/delete`, other models and every other route are refused.
+* Pi's own `~/.pi/agent` (including its `github-copilot` OAuth login) is **never** mounted or copied. The container gets a fresh agent dir.
+* Other providers: list **names** of orchestrator environment variables in `credentials`; values are written as `0400` files under
+  `.tasks/<id>/secrets/`, mounted read-only at `/run/secrets`, exported only into the Pi process by `entrypoint.sh` (not visible in
+  `docker inspect`, not in argv), redacted from recorded output, and deleted when the run ends. Those providers need internet, and
+  allow-listed egress is **not implemented** (`network` must be `none`), so this path is exercised only up to credential handling.
+* **Residual risk:** any credential given to the agent process is readable by that process and by any code it runs. The agent can send
+  it wherever its network allows (nowhere today). Do not give an untrusted agent a long-lived or high-privilege key.
+
+## Events, logs, results
+
+Events (`.tasks/<id>/events.jsonl`, `get_task_events`): `task.created, task.preparing, workspace.prepared, container.starting,
+container.started, agent.starting, agent.running, agent.output (assistant_message | tool_call | tool_result | retry | stderr),
+agent.stopping, agent.completed | agent.failed, task.completed | task.failed | task.cancelled, task.reconciled, container.cleaned`.
+Each has `seq, taskId, timestamp, type, runtime, data`. Raw stdout/stderr are kept separately (`stdout.log`, `stderr.log`, 20 MB cap,
+line-capped, secrets redacted); the orchestrator streams them line by line and never holds a whole output in memory.
+
+Normalized result (`result.json`): `taskId, containerId, runtime, status (completed|failed|timed_out|cancelled), exitCode, startedAt,
+finishedAt, durationMs, workspace, workspacePath, model, provider, artifacts[{path,status,type,size,sha256}], changes{added,modified,deleted,diffFile},
+output{finalMessage,usage,...}, logs, error{kind,code,message}`. `error.kind`: `agent_failure` (codes `model_error`, `auth_error`, `agent_error`,
+`no_result`, `out_of_memory`, `workspace_quota_exceeded`), `startup_failure` (`container_start_failed`, `missing_credentials`, `runtime_start_failed`),
+`timeout`, `cancelled`, `infrastructure` (`docker_unavailable`, `image_missing`, `image_uid_mismatch`, `llm_backend_unreachable`, `container_lost`, `orchestrator_lost`, `workspace_error`).
+Success requires a clean agent run: exit 0 **and** a completed Pi run without an error stop reason (Pi can exit 0 after a model error).
+
+## Workspaces
+
+`workspaces/<workspace_id>/` is bind-mounted rw at `/workspace` in exactly one container; nothing else under `workspaces/` is visible.
+The container runs as the *host uid* (image built with it) so files stay owned by you and remain after the container is gone.
+Before the run a baseline (manifest + small text files) is stored in `.tasks/<id>/baseline/`; afterwards the orchestrator computes added/
+modified/deleted files and a unified diff **in Python** — it never runs `git` (or anything else) inside the untrusted workspace, never follows
+symlinks, and cannot be blocked by FIFOs. A soft disk quota (`workspaceQuotaMb`, checked every 2 s) stops a runaway agent.
+
+## Restart recovery
+
+Task containers carry `multiagent.poc.kind=agent-task`; the Phase 1 `cleanup --stale` skips them. `task reconcile` / `TaskManager.reconcile()`
+adopts a task container only if it has this POC's labels, a task record on disk, and its owning run's lease is dead; it resumes watching with
+the *original* deadline, replays logs without duplicating events, restarts the model relay at the same socket path and honours pending cancels.
+Containers of live runs, unlabeled/other containers and containers without a record (they are removed only if stale and labeled) are respected.
+
+## Tests (Phase 2)
+
+```bash
+.venv/bin/python -m pytest -q -m "not live"                  # unit tests, no Docker (Phase 1 + 2)
+.venv/bin/python -m pytest -q -m "live and not e2e"          # real Docker, deterministic (isolation, lifecycle, recovery) - no LLM
+.venv/bin/python -m pytest -q -m e2e                         # real Pi + real local model (slow: ~10 min; needs ollama + qwen3-vl:8b)
+POC_E2E_MODEL=other:tag .venv/bin/python -m pytest -q -m e2e
+```
+
+## Phase 2 known limitations
+
+See [REPORT_PHASE2.md](REPORT_PHASE2.md) (section "Known limitations and security risks").
