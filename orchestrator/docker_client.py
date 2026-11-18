@@ -20,38 +20,59 @@ class DockerError(RuntimeError):
         self.not_found = not_found
 
 
+def _bind_mount_arg(host_path: str, container_path: str, read_only: bool) -> str:
+    for part in (host_path, container_path):
+        if "," in part or '"' in part or "\n" in part or not part.startswith("/"):
+            raise DockerError(f"refusing unsafe bind mount path: {part!r}")
+    return f"type=bind,src={host_path},dst={container_path}" + (",readonly" if read_only else "")
+
+
 def build_create_args(spec: ContainerSpec) -> list:
-    """`docker create` argv for one agent container. All isolation settings are fixed here."""
+    """`docker create` argv for one agent container. All isolation settings are fixed here.
+
+    Network is always `none`; privileged/host namespaces/docker socket are never configurable.
+    """
     mem = f"{spec.memory_mb}m"
+    user = spec.user or f"{spec.uid}:{spec.uid}"
     args = [
         "create",
         "--name", spec.name,
         "--init",  # reap zombies / forward signals
         "--network", "none",
         "--read-only",
-        "--tmpfs", (
+    ]
+    if spec.workspace_tmpfs:
+        args += ["--tmpfs", (
             f"{WORKSPACE_PATH}:rw,noexec,nosuid,nodev,"
             f"size={spec.workspace_size_mb}m,uid={spec.uid},gid={spec.uid},mode=0700"
-        ),
+        )]
+    for path, options in spec.tmpfs:
+        args += ["--tmpfs", f"{path}:{options}"]
+    for host_path, container_path, read_only in spec.mounts:
+        args += ["--mount", _bind_mount_arg(host_path, container_path, read_only)]
+    args += [
         "--workdir", WORKSPACE_PATH,
-        "--user", f"{spec.uid}:{spec.uid}",
+        "--user", user,
         "--cap-drop", "ALL",
         "--security-opt", "no-new-privileges=true",  # default seccomp profile stays applied
         "--cpus", str(spec.cpus),
         "--memory", mem,
         "--memory-swap", mem,  # no swap
         "--pids-limit", str(spec.pids_limit),
-        "--stop-timeout", "2",
+        "--stop-timeout", str(spec.stop_timeout_s),
         "--restart", "no",
         "--log-driver", "json-file",
-        "--log-opt", "max-size=1m",
+        "--log-opt", f"max-size={spec.log_max_size}",
         "--log-opt", "max-file=1",
     ]
     for key, value in spec.labels.items():
         args += ["--label", f"{key}={value}"]
     for key, value in spec.env.items():
         args += ["--env", f"{key}={value}"]
+    if spec.entrypoint:
+        args += ["--entrypoint", spec.entrypoint]
     args.append(spec.image)
+    args += list(spec.args)
     return args
 
 
@@ -85,8 +106,23 @@ class DockerClient:
     def image_exists(self, image: str) -> bool:
         return self._run(["image", "inspect", image], check=False).returncode == 0
 
-    def build_image(self, tag: str, context_dir: str) -> None:
-        self._run(["build", "-t", tag, context_dir], timeout=600)
+    def build_image(self, tag: str, context_dir: str, build_args: Optional[dict] = None) -> None:
+        args = ["build", "-t", tag]
+        for key, value in (build_args or {}).items():
+            args += ["--build-arg", f"{key}={value}"]
+        self._run([*args, context_dir], timeout=900)
+
+    def image_label(self, image: str, label: str) -> Optional[str]:
+        proc = self._run(["image", "inspect", "--format", f'{{{{index .Config.Labels "{label}"}}}}', image], check=False)
+        value = proc.stdout.decode().strip() if proc.returncode == 0 else ""
+        return value or None
+
+    def follow_logs(self, container_id: str) -> subprocess.Popen:
+        """Stream a container's stdout/stderr (docker logs -f) as two pipes; caller must drain both."""
+        return subprocess.Popen(
+            [self.binary, "logs", "-f", container_id],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
 
     # -- containers ---------------------------------------------------------------
     def create_container(self, spec: ContainerSpec) -> str:

@@ -22,7 +22,9 @@ from .lifecycle import (
 )
 from .models import (
     LABEL_AGENT_ID,
+    KIND_TASK,
     LABEL_CREATED_AT,
+    LABEL_KIND,
     LABEL_PROJECT,
     LABEL_PROJECT_VALUE,
     LABEL_RUN_ID,
@@ -297,13 +299,17 @@ class Orchestrator:
         """Remove containers of dead runs. Never touches this run, active runs or unlabeled containers.
 
         A container is removed only if it carries the project label AND a run-id label
-        AND that run's lease is not held by any live process.
+        AND that run's lease is not held by any live process. Phase 2 task containers
+        (label multiagent.poc.kind=agent-task) are never removed here; see TaskManager.reconcile().
         """
-        removed, active, unowned = [], set(), []
+        removed, active, unowned, tasks = [], set(), [], []
         by_run: dict[str, list] = {}
         for c in self.docker.list_containers(_PROJECT_FILTER):
-            run_id = (c["Config"].get("Labels") or {}).get(LABEL_RUN_ID)
-            if run_id:
+            labels = c["Config"].get("Labels") or {}
+            run_id = labels.get(LABEL_RUN_ID)
+            if labels.get(LABEL_KIND) == KIND_TASK:
+                tasks.append(c["Id"])  # Phase 2 tasks: TaskManager.reconcile() adopts or finalises them
+            elif run_id:
                 by_run.setdefault(run_id, []).append(c)
             else:
                 unowned.append(c["Id"])
@@ -324,6 +330,7 @@ class Orchestrator:
             "removed_containers": removed,
             "skipped_active_runs": sorted(active),
             "skipped_unowned_containers": unowned,
+            "skipped_task_containers": tasks,
         }
 
     def list_managed(self) -> list:

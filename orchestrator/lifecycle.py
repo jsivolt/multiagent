@@ -1,8 +1,9 @@
 """Agent state machine and run-ownership lease.
 
 State machine:
-    CREATED -> STARTING -> RUNNING -> {COMPLETED | FAILED | TIMED_OUT | CANCELLED}
-    CREATED/STARTING may also go straight to FAILED or CANCELLED.
+    CREATED -> [PREPARING ->] STARTING -> RUNNING -> {COMPLETED | FAILED | TIMED_OUT | CANCELLED}
+    (PREPARING is used by Phase 2 tasks only.)
+    CREATED/PREPARING/STARTING may also go straight to FAILED or CANCELLED.
     Any terminal state -> CLEANUP -> REMOVED.
 
 Run ownership: every Orchestrator holds an exclusive flock on
@@ -22,6 +23,7 @@ from pathlib import Path
 
 class AgentState(str, Enum):
     CREATED = "CREATED"
+    PREPARING = "PREPARING"  # Phase 2 only: workspace/credentials/runtime inputs being prepared
     STARTING = "STARTING"
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
@@ -38,7 +40,8 @@ TERMINAL_STATES = frozenset(
 
 _S = AgentState
 TRANSITIONS = {
-    _S.CREATED: {_S.STARTING, _S.FAILED, _S.CANCELLED},
+    _S.CREATED: {_S.PREPARING, _S.STARTING, _S.FAILED, _S.CANCELLED},
+    _S.PREPARING: {_S.STARTING, _S.FAILED, _S.CANCELLED},
     _S.STARTING: {_S.RUNNING, _S.FAILED, _S.CANCELLED},
     _S.RUNNING: {_S.COMPLETED, _S.FAILED, _S.TIMED_OUT, _S.CANCELLED},
     **{state: {_S.CLEANUP} for state in TERMINAL_STATES},

@@ -19,6 +19,9 @@ LABEL_RUN_ID = "multiagent.poc.run_id"
 LABEL_AGENT_ID = "multiagent.poc.agent_id"
 LABEL_TASK_ID = "multiagent.poc.task_id"
 LABEL_CREATED_AT = "multiagent.poc.created_at"
+LABEL_KIND = "multiagent.poc.kind"  # "agent-task": Phase 2 containers, reconciled (not blindly removed) after a crash
+KIND_TASK = "agent-task"
+LABEL_RUNTIME = "multiagent.poc.runtime"
 
 DEFAULT_IMAGE = "multiagent-poc-agent:phase1"
 WORKSPACE_PATH = "/workspace"
@@ -100,6 +103,15 @@ class ContainerSpec:
     pids_limit: int
     workspace_size_mb: int = WORKSPACE_SIZE_MB
     uid: int = AGENT_UID
+    # Phase 2 extensions; the defaults reproduce the Phase 1 container exactly.
+    workspace_tmpfs: bool = True  # Phase 1: tmpfs /workspace. Phase 2 tasks bind-mount their own dir instead.
+    tmpfs: tuple = ()  # extra (container_path, mount_options) tmpfs mounts
+    mounts: tuple = ()  # (host_path, container_path, read_only) bind mounts; only explicit paths, never broad ones
+    args: tuple = ()  # arguments passed to the image entrypoint
+    user: Optional[str] = None  # default "<uid>:<uid>"
+    stop_timeout_s: int = 2
+    log_max_size: str = "1m"
+    entrypoint: Optional[str] = None  # set only by runtime adapters (e.g. diagnostics); never by task requests
 
 
 @dataclass
